@@ -61,9 +61,23 @@ pyusb requires a libusb-compatible driver. Use [Zadig](https://zadig.akeo.ie/):
 
 1. Download and run Zadig
 2. Options → List All Devices
-3. Select the camera (VID 3474, PID 45C2 for P1 or 45A2 for P3)
+3. Select the camera interface (VID 3474, PID 45C2 for P1 or 45A2 for P3)
+   - For streaming, make sure interface `MI_01` / `com.thermalmaster.pios3` uses WinUSB
+   - Do not only replace the composite parent entry
+   - If Zadig only shows `Interface 0`, uncheck `Ignore Hubs or Composite Parents`,
+     select the camera composite parent entry, and install `libusbK`
 4. Select **WinUSB** driver
 5. Click "Replace Driver"
+
+Install a PyUSB backend DLL (required on Windows):
+
+```bash
+pip install libusb-package
+```
+
+If the camera is still not found, verify the PID in Device Manager:
+- PID `45C2` = P1 (`p3-viewer --model p1`)
+- PID `45A2` = P3 (`p3-viewer --model p3`)
 
 ## Usage
 

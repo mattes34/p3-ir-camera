@@ -20,10 +20,12 @@ import array
 import contextlib
 import dataclasses
 import logging
+import platform
 import struct
 import time
 
 import numpy as np
+import usb.backend.libusb1
 import usb.core
 import usb.util
 
@@ -166,6 +168,43 @@ def get_model_config(model: Model | str = Model.P3) -> ModelConfig:
 
 # Default model config
 _DEFAULT_CONFIG = get_model_config(Model.P3)
+_MODEL_CONFIG_BY_PID = {
+    config.pid: config
+    for config in (
+        get_model_config(Model.P1),
+        get_model_config(Model.P3),
+    )
+}
+
+WINDOWS_INTERFACE_HINT = (
+    "Windows USB driver issue: streaming interface (MI_01, "
+    "'com.thermalmaster.pios3') is not accessible. "
+    "In Zadig, enable 'Options -> List All Devices'. If MI_01 is available, "
+    "install WinUSB there. If only 'Interface 0' is shown, disable "
+    "'Ignore Hubs or Composite Parents', select the camera composite parent, "
+    "and install libusbK."
+)
+
+
+def _resolve_usb_backend() -> Any:
+    """Resolve a usable USB backend for PyUSB.
+
+    On Windows, pyusb's default backend lookup often fails even when
+    `libusb-package` is installed. Fall back to libusb_package helper when
+    available.
+    """
+    backend = usb.backend.libusb1.get_backend()
+    if backend is not None:
+        return backend
+
+    with contextlib.suppress(Exception):
+        import libusb_package
+
+        backend = libusb_package.get_libusb1_backend()
+        if backend is not None:
+            return backend
+
+    return None
 
 
 class GainMode(IntEnum):
@@ -624,10 +663,52 @@ class P3Camera:
 
     def connect(self) -> None:
         """Connect to the camera."""
+        backend = _resolve_usb_backend()
 
-        self.dev = usb.core.find(idVendor=VID, idProduct=self.config.pid)
+        try:
+            self.dev = usb.core.find(
+                idVendor=VID,
+                idProduct=self.config.pid,
+                backend=backend,
+            )
+        except usb.core.NoBackendError as exc:
+            raise RuntimeError(
+                "PyUSB backend not available. Install libusb "
+                "(Windows: `pip install libusb-package`)."
+            ) from exc
+
         if self.dev is None:
             model_name = self.config.model.value.upper()
+
+            # On Windows, missing libusb backend is a common setup issue.
+            if platform.system() == "Windows" and backend is None:
+                raise RuntimeError(
+                    "Camera not found because PyUSB has no libusb backend. "
+                    "Install/upgrade it with "
+                    "`python -m pip install --upgrade libusb-package`, "
+                    "then restart Python."
+                )
+
+            # If a camera with another known PID is present, show an actionable hint.
+            try:
+                detected = usb.core.find(
+                    find_all=True,
+                    idVendor=VID,
+                    backend=backend,
+                ) or []
+            except usb.core.NoBackendError:
+                detected = []
+            for dev in detected:
+                config = _MODEL_CONFIG_BY_PID.get(int(dev.idProduct))
+                if config is None or config.pid == self.config.pid:
+                    continue
+                detected_model = config.model.value.upper()
+                raise RuntimeError(
+                    f"{model_name} camera not found (PID=0x{self.config.pid:04X}). "
+                    f"Detected {detected_model} camera (PID=0x{config.pid:04X}). "
+                    f"Use `--model {config.model.value}`."
+                )
+
             raise RuntimeError(
                 f"{model_name} camera not found (PID=0x{self.config.pid:04X})"
             )
@@ -757,7 +838,12 @@ class P3Camera:
         time.sleep(1.0)
 
         # Configure streaming interface
-        self.dev.set_interface_altsetting(interface=1, alternate_setting=1)
+        try:
+            self.dev.set_interface_altsetting(interface=1, alternate_setting=1)
+        except NotImplementedError as exc:
+            if platform.system() == "Windows":
+                raise RuntimeError(WINDOWS_INTERFACE_HINT) from exc
+            raise
         self.dev.ctrl_transfer(0x40, 0xEE, 0, 1, None, 1000)
 
         # Wait for camera to be ready (Windows tool waits ~2 seconds)
@@ -1070,4 +1156,9 @@ class P3Camera:
             return
         self.dev.set_configuration()
         usb.util.claim_interface(self.dev, 0)
-        usb.util.claim_interface(self.dev, 1)
+        try:
+            usb.util.claim_interface(self.dev, 1)
+        except NotImplementedError as exc:
+            if platform.system() == "Windows":
+                raise RuntimeError(WINDOWS_INTERFACE_HINT) from exc
+            raise

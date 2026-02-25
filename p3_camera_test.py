@@ -24,6 +24,7 @@ from p3_camera import (
     FrameStats,
     GainMode,
     Model,
+    P3Camera,
     apply_emissivity_correction,
     build_command,
     celsius_to_kelvin,
@@ -38,6 +39,7 @@ from p3_camera import (
     raw_to_celsius,
     raw_to_celsius_corrected,
     raw_to_kelvin,
+    _resolve_usb_backend,
 )
 
 
@@ -459,6 +461,116 @@ class TestExceptions:
         """Test FrameMarkerMismatchError exception."""
         with pytest.raises(FrameMarkerMismatchError):
             raise FrameMarkerMismatchError("cnt1 mismatch: start=1, end=2")
+
+
+class TestConnection:
+    """Tests for camera connection behavior."""
+
+    def test_connect_hints_libusb_when_missing_on_windows(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Windows should show actionable hint when libusb backend is missing."""
+        import p3_camera
+
+        camera = P3Camera()
+
+        monkeypatch.setattr(p3_camera.usb.core, "find", lambda **kwargs: None)
+        monkeypatch.setattr(p3_camera.platform, "system", lambda: "Windows")
+        monkeypatch.setattr(
+            p3_camera.usb.backend.libusb1,
+            "get_backend",
+            lambda: None,
+        )
+
+        with pytest.raises(RuntimeError, match="libusb backend"):
+            camera.connect()
+
+    def test_connect_hints_model_mismatch(self, monkeypatch: pytest.MonkeyPatch):
+        """When another known model is attached, error should suggest --model."""
+        import p3_camera
+
+        camera = P3Camera(config=get_model_config(Model.P3))
+
+        class FakeDevice:
+            idProduct = 0x45C2
+
+        def fake_find(**kwargs):
+            if kwargs.get("idProduct") == 0x45A2:
+                return None
+            if kwargs.get("find_all") and kwargs.get("idVendor") == 0x3474:
+                return [FakeDevice()]
+            return None
+
+        monkeypatch.setattr(p3_camera.usb.core, "find", fake_find)
+        monkeypatch.setattr(p3_camera.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(
+            p3_camera.usb.backend.libusb1,
+            "get_backend",
+            lambda: object(),
+        )
+
+        with pytest.raises(RuntimeError, match="Use `--model p1`"):
+            camera.connect()
+
+    def test_resolve_usb_backend_uses_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Resolver should use pyusb default backend when available."""
+        import p3_camera
+
+        sentinel = object()
+        monkeypatch.setattr(
+            p3_camera.usb.backend.libusb1,
+            "get_backend",
+            lambda: sentinel,
+        )
+        assert _resolve_usb_backend() is sentinel
+
+    def test_resolve_usb_backend_falls_back_to_libusb_package(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Resolver should fall back to libusb_package helper on Windows."""
+        import types
+
+        import p3_camera
+
+        sentinel = object()
+        monkeypatch.setattr(
+            p3_camera.usb.backend.libusb1,
+            "get_backend",
+            lambda: None,
+        )
+        monkeypatch.setitem(
+            sys.modules,
+            "libusb_package",
+            types.SimpleNamespace(get_libusb1_backend=lambda: sentinel),
+        )
+
+        assert _resolve_usb_backend() is sentinel
+
+    def test_claim_interfaces_shows_windows_hint(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Windows should get actionable hint if interface 1 cannot be claimed."""
+        import p3_camera
+
+        camera = P3Camera()
+
+        class FakeDevice:
+            def set_configuration(self):
+                return None
+
+        def fake_claim_interface(_dev, interface):
+            if interface == 1:
+                raise NotImplementedError("Operation not supported")
+            return None
+
+        camera.dev = FakeDevice()
+        monkeypatch.setattr(p3_camera.platform, "system", lambda: "Windows")
+        monkeypatch.setattr(p3_camera.usb.util, "claim_interface", fake_claim_interface)
+
+        with pytest.raises(RuntimeError, match="MI_01"):
+            camera._claim_interfaces()
 
 
 def _run_tests(test_file: str) -> None:
